@@ -13,6 +13,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Rotation matrix utilities and geometric transformations.
+
+This module provides a collection of utilities for working with 2D and 3D rotations,
+including conversions between different rotation representations (Euler angles, SO(3)
+matrices, yaw angles), coordinate transformations, and angle normalization functions.
+
+Supports both NumPy and PyTorch tensor operations for flexibility in different
+computational contexts.
+"""
+
 from typing import Optional, TypeVar, Union
 
 import numpy as np
@@ -174,15 +184,15 @@ def stable_gramschmidt(M: torch.Tensor) -> torch.Tensor:
     return R
 
 
-def rot_3d_to_2d(rot):
+def rot_3d_to_2d(rot: torch.Tensor) -> torch.Tensor:
     """Converts a 3D rotation matrix to a 2D rotation matrix by taking the x and y axes of the 3D
     rotation matrix, projecting them to xy plan, and performing gram-schmidt orthogonalization.
 
     Args:
-        rot (torch.Tensor): The 3D rotation matrix to convert.
+        rot: The 3D rotation matrix to convert. Shape: [..., 3, 3].
 
     Returns:
-        torch.Tensor: The 2D rotation matrix.
+        The 2D rotation matrix. Shape: [..., 2, 2].
     """
     xu = rot[..., :2, 0]
     yu = rot[..., :2, 1]
@@ -213,9 +223,19 @@ def rot_2d_to_3d(rot: torch.Tensor) -> torch.Tensor:
     return rot
 
 
-def ratan2(s, c, eps=1e-4):
-    """Robust arctan2 for pytorch
-    torch.arctan2(0,0)=nan, this function avoids the nan situation and returns ratan2(0,0)=0
+def ratan2(s: torch.Tensor, c: torch.Tensor, eps: float = 1e-4) -> torch.Tensor:
+    """Robust arctan2 for PyTorch that handles edge cases.
+
+    Standard torch.arctan2(0,0) returns NaN, but this function avoids the NaN
+    situation by adding a small epsilon when needed, returning ratan2(0,0)=0.
+
+    Args:
+        s: Sine component (y-coordinate). Can be any shape.
+        c: Cosine component (x-coordinate). Must be same shape as s.
+        eps: Small epsilon value to add for numerical stability. Defaults to 1e-4.
+
+    Returns:
+        Arctangent of s/c in radians, with the same shape as inputs.
     """
     sign = (c >= 0).float() * 2 - 1
     eps = eps * (c.abs() < eps).type(c.dtype) * sign
