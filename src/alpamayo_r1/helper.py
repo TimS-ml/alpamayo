@@ -49,9 +49,10 @@ def create_message(frames: torch.Tensor) -> list[dict[str, Any]]:
         contains 'role' and 'content' keys formatted for the VLM processor.
 
     Raises:
-        AssertionError: If frames does not have 4 dimensions.
+        ValueError: If frames does not have 4 dimensions.
     """
-    assert frames.ndim == 4, f"{frames.ndim=}, expected (N, C, H, W)"
+    if frames.ndim != 4:
+        raise ValueError(f"{frames.ndim=}, expected 4 (N, C, H, W)")
 
     # NOTE: we expand the padding tokens to match training, so we can directly apply native processor from VLM.
     num_traj_token = 48

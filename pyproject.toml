@@ -3,23 +3,27 @@ name = "alpamayo_r1"
 version = "0.1.0"
 requires-python = "==3.12.*"
 dependencies = [
-  "accelerate>=1.12.0",
-  "av>=16.0.1",
+  "colorlog>=6.0.0",
   "einops>=0.8.1",
-  "hydra-colorlog>=1.2.0",
   "hydra-core>=1.3.2",
-  "pandas>=2.3.3",
-  "physical_ai_av>=0.1.0",
+  "physical_ai_av>=0.2.0",
   "pillow>=12.0.0",
   "torch==2.8.0",
   "torchvision>=0.23.0",
   "transformers==4.57.1",
   "flash-attn>=2.8.3",
+  "scipy",
 ]
 
 [build-system]
-requires = ["uv_build>=0.9.7,<0.10.0"]
-build-backend = "uv_build"
+requires = ["hatchling>=1.27.0"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/alpamayo_r1"]
+
+[tool.hatch.build.targets.sdist]
+include = ["/pyproject.toml", "/src"]
 
 [dependency-groups]
 dev = [
