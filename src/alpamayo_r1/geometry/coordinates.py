@@ -13,6 +13,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Geometry helpers for 3D coordinate / bounding-box operations.
+
+Currently provides :func:`xyzrot_to_corners`, which converts a center position,
+SO(3) rotation matrix, and box dimensions into the 8 corner points of a 3D
+bounding box. The implementation is fully batched: all leading dimensions are
+treated as batch dimensions and only the trailing axes carry geometric meaning.
+"""
+
 import torch
 
 
@@ -29,6 +37,8 @@ def xyzrot_to_corners(xyz: torch.Tensor, rot: torch.Tensor, dims: torch.Tensor) 
         corns: ...x8x3 corners of the bounding box. The first 4 points are the bottom
                corners and the next 4 are the top corners.
     """
+    # Unit cube corners centered at the origin: first 4 rows are the bottom face
+    # (z = -0.5), last 4 are the top face (z = +0.5). Scaled, rotated, translated below.
     corns = torch.tensor(
         [
             [-0.5, -0.5, -0.5],

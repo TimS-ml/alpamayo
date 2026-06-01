@@ -1,385 +1,246 @@
 # Model Inference Flow
 
-This document describes the complete function call sequence during Alpamayo-R1 model inference, from data loading to trajectory prediction.
+The end-to-end function call sequence during Alpamayo-R1 inference, from data
+loading to trajectory prediction. Names, signatures, and line numbers were
+verified against the source (post-`upstream/main` merge).
 
 ## Overview
 
-Alpamayo-R1 inference combines a Vision-Language Model (VLM) for reasoning with a diffusion-based expert model for trajectory generation. The process involves:
+Alpamayo-R1 pairs a Vision-Language Model (VLM) that reasons in text with a
+diffusion **expert** transformer that generates trajectories. One inference call
+performs:
 
-1. **Data Loading & Preprocessing**
-2. **VLM Generation** (Chain-of-Causation reasoning)
-3. **Diffusion Sampling** (Trajectory generation)
-4. **Action Space Conversion** (Control to trajectory)
+1. **Data loading & ego-frame transform** — `load_physical_aiavdataset.py`
+2. **Input preparation** — `helper.create_message` + processor
+3. **Trajectory-history token fusion** — `TrajectoryFusionMixin.fuse_traj_tokens`
+4. **VLM rollout** (Chain-of-Causation reasoning + KV cache) — `self.vlm.generate`
+5. **Flow-matching diffusion sampling** (expert reuses the VLM KV cache)
+6. **Action → trajectory unroll** — `UnicycleAccelCurvatureActionSpace.action_to_traj`
 
----
-
-## Detailed Inference Pipeline
-
-### 1. Data Loading & Preprocessing
-
-**Entry Point:** `load_physical_aiavdataset.py`
-
-#### Key Functions:
-- **`load_physical_aiavdataset.prepare_data_from_token()`**
-  - **Location:** `src/alpamayo_r1/load_physical_aiavdataset.py:123`
-  - **Purpose:** Load multi-camera images and ego trajectory history from dataset
-  - **Inputs:**
-    - `token`: Dataset sample identifier
-    - `cam_list`: List of camera names (e.g., `["CAM_FRONT", "CAM_FRONT_LEFT", ...]`)
-  - **Outputs:**
-    - `images`: Tensor of shape `(N_cameras, C, H, W)`
-    - `ego_hist_traj`: Historical trajectory in local frame, shape `(T_hist, 3)`
-    - `ego_gt_traj`: Ground truth future trajectory (for evaluation)
-    - `ego_hist_rot_mat`: Historical rotation matrices, shape `(T_hist, 3, 3)`
-
-#### Coordinate Transformation:
-```python
-# Transform from global to local (ego-centric) frame
-ego_hist_traj = global_to_local_frame(traj_global, current_pose)
-```
+The entry point that orchestrates steps 3-6 is
+`AlpamayoR1.sample_trajectories_from_data_with_vlm_rollout()`
+(`models/alpamayo_r1.py:124`).
 
 ---
 
-### 2. Input Preparation
+## 1. Data Loading & Ego-Frame Transform
 
-**Module:** `helper.py`
+**`load_physical_aiavdataset(clip_id, t0_us=5_100_000, ...)`** —
+`load_physical_aiavdataset.py:27`
 
-#### Key Functions:
+- Loads egomotion and 4 camera streams (default cross-left/front-wide/
+  cross-right/front-tele, `num_frames=4`).
+- Builds `num_history_steps=16` history timestamps ending at `t0` and
+  `num_future_steps=64` future timestamps (`time_step=0.1s`).
+- Transforms all poses into the **ego frame at `t0`** (the last history pose):
+  `xyz_local = R_t0⁻¹ · (xyz_world − xyz_t0)` (lines 134-147).
 
-##### **`create_message(frames)`**
-- **Location:** `src/alpamayo_r1/helper.py:35`
-- **Purpose:** Create chat message format with images and trajectory placeholders
-- **Inputs:**
-  - `frames`: Image tensor `(N, C, H, W)`
-- **Outputs:**
-  - Chat messages with:
-    - System prompt
-    - User message (images + trajectory placeholder tokens)
-    - Assistant prompt starting with `<|cot_start|>`
-- **Special Tokens:**
-  - `<|traj_history_start|>`, `<|traj_history|>` (×48), `<|traj_history_end|>`
+Outputs (batch dims prepended → `(B=1, n_traj_group=1, …)`):
 
-##### **`get_processor(tokenizer)`**
-- **Location:** `src/alpamayo_r1/helper.py:94`
-- **Purpose:** Initialize VLM processor with custom tokenizer
-- **Inputs:**
-  - `tokenizer`: Custom tokenizer with special tokens
-- **Outputs:**
-  - `AutoProcessor` configured for Qwen3-VL-2B
-
-#### Tokenization:
-```python
-processor = get_processor(tokenizer)
-messages = create_message(frames)
-text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=False)
-inputs = processor(text=text, images=frames, return_tensors="pt")
-```
+| Key | Shape |
+|-----|-------|
+| `image_frames` | `(N_cam, num_frames, 3, H, W)` |
+| `ego_history_xyz` | `(1, 1, 16, 3)` |
+| `ego_history_rot` | `(1, 1, 16, 3, 3)` |
+| `ego_future_xyz` | `(1, 1, 64, 3)` |
+| `ego_future_rot` | `(1, 1, 64, 3, 3)` |
 
 ---
 
-### 3. Trajectory Tokenization
+## 2. Input Preparation
 
-**Module:** `base_model.py`, `delta_tokenizer.py`
+**`create_message(frames)`** — `helper.py:35`
 
-#### Key Functions:
+Builds a 3-message chat list:
 
-##### **`DeltaTrajectoryTokenizer.tokenize()`**
-- **Location:** `src/alpamayo_r1/models/delta_tokenizer.py:81`
-- **Purpose:** Convert trajectory to token IDs using delta encoding
-- **Process:**
-  1. Compute deltas: `Δx_t = x_t - x_{t-1}`
-  2. Quantize deltas to discrete bins
-  3. Map bins to token IDs
-- **Inputs:**
-  - `trajectory`: Shape `(B, T, 3)` (xyz positions)
-- **Outputs:**
-  - `token_ids`: Shape `(B, T*3)` (flattened xyz tokens)
+- **system:** `"You are a driving assistant that generates safe and accurate actions."`
+- **user:** one image entry per frame, then the text
+  `"<|traj_history_start|>" + "<|traj_history|>"*48 + "<|traj_history_end|>" +
+  "output the chain-of-thought reasoning ... then output the future trajectory."`
+- **assistant:** `"<|cot_start|>"` (primes Chain-of-Causation).
 
-##### **`ReasoningVLA._fuse_traj_history_tokens()`**
-- **Location:** `src/alpamayo_r1/models/base_model.py:199`
-- **Purpose:** Replace placeholder tokens with trajectory tokens
-- **Process:**
-  1. Extract positions of `<|traj_history|>` tokens
-  2. Replace with actual trajectory token IDs
-- **Inputs:**
-  - `input_ids`: Token IDs from processor
-  - `traj_hist_token_ids`: Tokenized trajectory
-- **Outputs:**
-  - Modified `input_ids` with embedded trajectory
+**`get_processor(tokenizer)`** — `helper.py:95`: loads the
+`Qwen/Qwen3-VL-2B-Instruct` processor (`min_pixels=163840`, `max_pixels=196608`)
+and swaps in the custom tokenizer carrying the special trajectory/CoC tokens.
+
+`test_inference.py` then calls
+`processor.apply_chat_template(messages, tokenize=True, add_generation_prompt=False,
+continue_final_message=True, return_dict=True, return_tensors="pt")` and moves
+everything to CUDA with `helper.to_device`.
 
 ---
 
-### 4. VLM Generation (Chain-of-Causation)
+## 3. Trajectory-History Token Fusion
 
-**Module:** `alpamayo_r1.py`
+**`TrajectoryFusionMixin.fuse_traj_tokens(input_ids, traj_data)`** —
+`base_model.py:168` (called from `alpamayo_r1.py:164`)
 
-#### Main Function:
+1. `tokenize_history_trajectory(...)` (`base_model.py:91`) encodes
+   `ego_history_xyz/rot` into discrete history tokens.
+2. `replace_pad_token(...)` (`base_model.py:85`) replaces the `<|traj_history|>`
+   placeholder ids in `input_ids` with those tokens.
 
-##### **`AlpamayoR1.sample_trajectories_from_data_with_vlm_rollout()`**
-- **Location:** `src/alpamayo_r1/models/alpamayo_r1.py:198`
-- **Purpose:** Generate reasoning text and cache VLM context
+History tokenization uses `DeltaTrajectoryTokenizer.encode` (`delta_tokenizer.py:47`):
+delta encoding `Δx_t = x_t − x_{t-1}`, min-max normalization over
+`ego_xyz_min/max`, quantization to `num_bins=1000`.
 
-#### Detailed Steps:
+---
 
-**Step 4.1: Prepare VLM Inputs**
+## 4. VLM Rollout (Chain-of-Causation)
+
+Inside `sample_trajectories_from_data_with_vlm_rollout` (lines 167-210):
+
 ```python
-# Location: alpamayo_r1.py:231
-input_ids = self._fuse_traj_history_tokens(inputs['input_ids'], traj_hist_token_ids)
-pixel_values = inputs['pixel_values']
-image_grid_thw = inputs['image_grid_thw']
-```
+eos_token_id = self.tokenizer.convert_tokens_to_ids(to_special_token("traj_future_start"))
+stopping_criteria = StoppingCriteriaList([StopAfterEOS(eos_token_id=eos_token_id)])
+logits_processor = LogitsProcessorList([ExpertLogitsProcessor(
+    traj_token_offset=config.traj_token_start_idx, traj_vocab_size=config.traj_vocab_size)])
 
-**Step 4.2: Autoregressive VLM Generation**
-```python
-# Location: alpamayo_r1.py:240
-outputs = self.vlm.generate(
-    input_ids=input_ids,
-    pixel_values=pixel_values,
-    image_grid_thw=image_grid_thw,
-    max_new_tokens=512,
-    eos_token_id=traj_future_start_token_id,  # Stop at trajectory generation
-    return_dict_in_generate=True,
-    output_hidden_states=True,
-    use_cache=True,
+vlm_outputs = self.vlm.generate(
+    input_ids=input_ids, generation_config=generation_config,
+    stopping_criteria=stopping_criteria, logits_processor=logits_processor,
+    **tokenized_data,                      # pixel_values, image_grid_thw, ...
 )
+prompt_cache = vlm_outputs.past_key_values        # the KV cache reused below
+prefill_seq_len = prompt_cache.get_seq_length()
 ```
 
-**Step 4.3: Extract KV Cache**
-```python
-# Location: alpamayo_r1.py:252
-past_key_values = outputs.past_key_values  # Cached VLM context
-generated_text = tokenizer.decode(outputs.sequences[0])  # CoC reasoning
-```
+- Generation samples `num_traj_samples` sequences (`num_return_sequences`),
+  `top_p=0.98`, `temperature=0.6`, up to `tokens_per_future_traj` (=64) new tokens.
+- It **stops at `<|traj_future_start|>`** (`StopAfterEOS` allows one extra token so
+  the KV cache is complete).
+- `ExpertLogitsProcessor` masks the discrete trajectory-token block to `-inf` so
+  the VLM produces only reasoning text, not discrete trajectory tokens.
+- The VLM KV cache (`prompt_cache`) is saved and reused by the expert for every
+  diffusion step — the VLM runs **once**.
 
-**Example Generated Text:**
-```
-<|cot_start|>I observe the vehicle is approaching an intersection with a red light.
-The pedestrian is crossing from the right. I need to decelerate and stop before
-the crosswalk to ensure safety.<|cot_end|><|traj_future_start|>
-```
+Per-sequence `<|traj_future_start|>` positions are located to build the expert's
+3-axis mRoPE `position_ids` and an `attention_mask` that hides padding
+(lines 212-250).
 
 ---
 
-### 5. Diffusion Sampling (Trajectory Generation)
+## 5. Flow-Matching Diffusion Sampling
 
-**Module:** `alpamayo_r1.py`, `flow_matching.py`
+The expert denoises actions of shape `(b*, n_waypoints, 2)` where
+`n_waypoints = action_space.get_action_space_dims()[0]` (=64) and `2 =
+(acceleration, curvature)`.
 
-#### Main Function:
-
-##### **`AlpamayoR1._sample_with_expert_model()`**
-- **Location:** `src/alpamayo_r1/models/alpamayo_r1.py:291`
-- **Purpose:** Sample trajectories using flow matching diffusion
-
-#### Detailed Steps:
-
-**Step 5.1: Initialize Diffusion**
-```python
-# Location: alpamayo_r1.py:308
-num_samples = 32  # Number of trajectory samples
-action_dim = 2  # (acceleration, curvature)
-pred_horizon = 12  # Future timesteps
-
-# Random noise initialization
-actions = torch.randn(batch_size, num_samples, pred_horizon, action_dim)
-```
-
-**Step 5.2: Diffusion Loop**
-```python
-# Location: alpamayo_r1.py:320
-for step_idx in range(num_inference_steps):  # Default: 10 steps
-    # (a) Compute timestep
-    t = timesteps[step_idx] / 1000.0  # Normalize to [0, 1]
-
-    # (b) Project action to token embeddings
-    action_embeds = self.action_in_proj(actions, t)  # Shape: (B*N, T, D)
-
-    # (c) Run expert model with cached VLM context
-    expert_outputs = self.expert_model(
-        inputs_embeds=action_embeds,
-        past_key_values=past_key_values,  # From VLM
-        use_cache=True,
-    )
-
-    # (d) Predict velocity field
-    expert_last_hidden_state = expert_outputs.last_hidden_state
-    predicted_velocity = self.action_head(expert_last_hidden_state)  # (B*N, T, 2)
-
-    # (e) Update actions via Euler integration
-    dt = timesteps[step_idx] - timesteps[step_idx + 1]
-    actions = actions + predicted_velocity * dt
-```
-
-**Step 5.3: Action Projection Details**
-
-##### **`ActionInputProjection.__call__()`**
-- **Location:** `src/alpamayo_r1/models/action_in_proj.py:124`
-- **Process:**
-  1. Apply Fourier feature encoding to timestep `t`
-  2. Concatenate action and Fourier features: `[action, fourier(t)]`
-  3. Pass through MLP to get embeddings of size `hidden_dim`
+**Denoiser closure `step_fn(x, t)`** — `alpamayo_r1.py:257`:
 
 ```python
-# Fourier encoding
-time_embeds = self.fourier_encode(t)  # Shape: (B*N, fourier_dim)
-
-# Concatenate with action
-x = torch.cat([actions, time_embeds.unsqueeze(1).expand(-1, T, -1)], dim=-1)
-
-# MLP projection
-action_embeds = self.mlp(x)  # Shape: (B*N, T, hidden_dim)
+future_token_embeds = self.action_in_proj(x, t)          # (b*, n_waypoints, hidden)
+expert_out = self.expert(inputs_embeds=future_token_embeds,
+                         position_ids=position_ids,
+                         past_key_values=prompt_cache,     # reuse VLM context
+                         attention_mask=attention_mask, use_cache=True, **fk)
+prompt_cache.crop(prefill_seq_len)                        # remove expert's KV
+last_hidden = expert_out.last_hidden_state[:, -n_diffusion_tokens:]
+pred = self.action_out_proj(last_hidden).view(-1, n_waypoints, 2)  # velocity field
 ```
+
+**Sampler** — `FlowMatching.sample → _euler` (`flow_matching.py:61 / 100`),
+default `num_inference_steps=10`, integrating **from noise (t=0) to data (t=1):**
+
+```python
+x = torch.randn(batch_size, *self.x_dims, device=device)   # x_dims = (n_waypoints, 2)
+time_steps = torch.linspace(0.0, 1.0, inference_step + 1)
+for i in range(inference_step):
+    dt = time_steps[i+1] - time_steps[i]
+    v  = step_fn(x=x, t=time_steps[i]...)
+    x  = x + dt * v
+```
+
+This direction matches training, where
+`noisy_x = t*x + (1-t)*noise` and the target velocity is `x - noise`
+(`construct_training_data` / `compute_loss_from_pred`).
+
+`action_in_proj` (`PerWaypointActionInProjV2`, `action_in_proj.py:148`)
+Fourier-encodes each action component and the timestep (log-spaced frequencies),
+concatenates, and passes them through an MLP. `action_out_proj` is the linear
+velocity head.
 
 ---
 
-### 6. Action Space Conversion
+## 6. Action → Trajectory Unroll
 
-**Module:** `unicycle_accel_curvature.py`
+**`UnicycleAccelCurvatureActionSpace.action_to_traj(action, hist_xyz, hist_rot)`**
+— `unicycle_accel_curvature.py:300`
 
-#### Key Function:
+After de-normalizing `(accel, curvature)` with the registered buffers, integrate
+the unicycle model (`dt=0.1`, `n_waypoints=64`):
 
-##### **`UnicycleActionSpace.unroll()`**
-- **Location:** `src/alpamayo_r1/action_space/unicycle_accel_curvature.py:223`
-- **Purpose:** Convert (acceleration, curvature) controls to xyz trajectory
-- **Inputs:**
-  - `actions`: Shape `(B, N_samples, T, 2)` - (acceleration, curvature)
-  - `initial_state`: Current velocity and position
-- **Outputs:**
-  - `trajectory`: Shape `(B, N_samples, T, 3)` - xyz positions
-  - `rotation_matrices`: Shape `(B, N_samples, T, 3, 3)` - orientations
-
-#### Unicycle Kinematics:
-```python
-# At each timestep t:
-for t in range(pred_horizon):
-    # Extract controls
-    acceleration = actions[..., t, 0]
-    curvature = actions[..., t, 1]
-
-    # Update velocity
-    velocity = velocity + acceleration * dt
-
-    # Update heading
-    angular_velocity = velocity * curvature
-    heading = heading + angular_velocity * dt
-
-    # Update position
-    dx = velocity * cos(heading) * dt
-    dy = velocity * sin(heading) * dt
-    position = position + [dx, dy, 0]
-
-    # Store trajectory
-    trajectory[..., t, :] = position
 ```
+velocity:  v_{t+1} = v0 + cumsum(a · dt)
+heading:   Δθ_t    = κ_t · (v_t·dt + ½·a_t·dt²)           # 2nd-order term
+position:  Δx_t    = dt/2 · (v_t cosθ_t + v_{t+1} cosθ_{t+1})   # trapezoidal
+           Δy_t    = dt/2 · (v_t sinθ_t + v_{t+1} sinθ_{t+1})
+z:         copied from the last history point
+rotations: rot_2d_to_3d(rotation_matrix_torch(theta))
+```
+
+Returns `pred_xyz (..., 64, 3)` and `pred_rot (..., 64, 3, 3)`, which the caller
+rearranges to `(B, num_traj_sets, num_traj_samples, 64, 3)`.
 
 ---
 
 ## Complete Call Graph
 
 ```
-1. load_physical_aiavdataset.prepare_data_from_token()
-   └─> Returns: images, ego_hist_traj, ego_gt_traj
-
-2. helper.create_message(images)
-   └─> Returns: chat_messages
-
-3. helper.get_processor(tokenizer)
-   └─> processor.apply_chat_template(messages)
-   └─> processor(text, images)
-   └─> Returns: input_ids, pixel_values, image_grid_thw
-
-4. delta_tokenizer.DeltaTrajectoryTokenizer.tokenize(ego_hist_traj)
-   └─> Returns: traj_hist_token_ids
-
-5. base_model.ReasoningVLA._fuse_traj_history_tokens()
-   └─> Returns: input_ids (with embedded trajectory)
-
-6. alpamayo_r1.AlpamayoR1.sample_trajectories_from_data_with_vlm_rollout()
-   │
-   ├─> 6.1: vlm.generate()  # VLM autoregressive generation
-   │   └─> Returns: generated_sequences, past_key_values
-   │
-   └─> 6.2: _sample_with_expert_model()  # Diffusion sampling
-       │
-       ├─> 6.2.1: Initialize random noise
-       │
-       ├─> 6.2.2: Diffusion loop (10 steps):
-       │   │
-       │   ├─> action_in_proj.ActionInputProjection()
-       │   │   ├─> fourier_encode(timestep)
-       │   │   └─> mlp([actions, fourier_features])
-       │   │
-       │   ├─> expert_model.forward(action_embeds, past_key_values)
-       │   │
-       │   ├─> action_head(expert_last_hidden_state)
-       │   │   └─> Returns: predicted_velocity
-       │   │
-       │   └─> Euler step: actions += velocity * dt
-       │
-       └─> 6.2.3: unicycle_accel_curvature.UnicycleActionSpace.unroll()
-           └─> Returns: trajectories (xyz), rotations
-
-7. Returns: trajectories, rotations, reasoning_text
+test_inference.py
+└─ load_physical_aiavdataset()                         # images + ego history/future
+└─ helper.create_message(frames)                       # chat messages
+└─ helper.get_processor(model.tokenizer)               # processor (Qwen3-VL-2B)
+   └─ processor.apply_chat_template(...)                # input_ids, pixel_values, ...
+└─ AlpamayoR1.sample_trajectories_from_data_with_vlm_rollout(data, ...)
+   ├─ TrajectoryFusionMixin.fuse_traj_tokens()          # embed history tokens
+   │   ├─ tokenize_history_trajectory()
+   │   └─ DeltaTrajectoryTokenizer.encode()
+   ├─ self.vlm.generate(...)                            # CoC text + KV cache
+   │   ├─ StopAfterEOS (stop at <|traj_future_start|>)
+   │   └─ ExpertLogitsProcessor (mask discrete traj tokens)
+   ├─ self.diffusion.sample(batch_size, step_fn, ...)   # FlowMatching._euler, 10 steps
+   │   └─ step_fn(x, t):
+   │       ├─ action_in_proj(x, t)                      # PerWaypointActionInProjV2
+   │       ├─ self.expert(inputs_embeds=..., past_key_values=prompt_cache)
+   │       ├─ prompt_cache.crop(prefill_seq_len)
+   │       └─ action_out_proj(last_hidden)              # velocity field
+   └─ action_space.action_to_traj(sampled_action, ...)  # unicycle unroll
+└─ minADE over xy(pred, ego_future_xyz)
 ```
 
 ---
 
 ## Function Reference Table
 
-| Function | Location | Purpose | Input → Output |
-|----------|----------|---------|----------------|
-| `prepare_data_from_token()` | `load_physical_aiavdataset.py:123` | Load dataset sample | `token` → `images, traj_hist, traj_gt` |
-| `create_message()` | `helper.py:35` | Create chat format | `frames` → `chat_messages` |
-| `get_processor()` | `helper.py:94` | Init VLM processor | `tokenizer` → `processor` |
-| `DeltaTrajectoryTokenizer.tokenize()` | `delta_tokenizer.py:81` | Trajectory → tokens | `traj (B,T,3)` → `token_ids (B,T*3)` |
-| `_fuse_traj_history_tokens()` | `base_model.py:199` | Embed traj in input | `input_ids, traj_tokens` → `input_ids` |
-| `vlm.generate()` | Transformers library | VLM reasoning | `input_ids, images` → `text, kv_cache` |
-| `_sample_with_expert_model()` | `alpamayo_r1.py:291` | Diffusion sampling | `kv_cache` → `actions (B,N,T,2)` |
-| `ActionInputProjection()` | `action_in_proj.py:124` | Action → embeddings | `actions, t` → `embeds` |
-| `expert_model.forward()` | Transformers library | Predict velocity | `embeds, kv_cache` → `hidden_states` |
-| `action_head()` | `alpamayo_r1.py:92` | Hidden → velocity | `hidden (B,N,T,D)` → `velocity (B,N,T,2)` |
-| `UnicycleActionSpace.unroll()` | `unicycle_accel_curvature.py:223` | Actions → trajectory | `actions (B,N,T,2)` → `traj (B,N,T,3)` |
-
----
-
-## Execution Timeline
-
-```
-Time Step │ Component        │ Operation
-──────────┼──────────────────┼─────────────────────────────────────
-t=0       │ DataLoader       │ Load images + trajectory history
-t=1       │ Preprocessor     │ Create chat messages, tokenize
-t=2       │ Tokenizer        │ Tokenize trajectory history
-t=3       │ VLM             │ Generate reasoning (autoregressive)
-          │                 │ "I see red light → must decelerate"
-t=4       │ VLM             │ Cache key-value states
-t=5       │ Diffusion       │ Initialize noise (32 samples)
-t=6..15   │ Expert Model    │ 10 diffusion steps:
-          │                 │   - Project action + time
-          │                 │   - Predict velocity
-          │                 │   - Update action
-t=16      │ Action Space    │ Convert actions → xyz trajectory
-t=17      │ Output          │ Return: traj, rotations, reasoning
-```
-
----
-
-## Key Configuration Parameters
-
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `num_inference_steps` | 10 | Number of diffusion sampling steps |
-| `num_samples` | 32 | Number of trajectory samples to generate |
-| `pred_horizon` | 12 | Future trajectory length (timesteps) |
-| `action_dim` | 2 | Action space dimension (accel, curvature) |
-| `dt` | 0.5 | Timestep duration (seconds) |
-| `min_pixels` | 163840 | VLM min image resolution |
-| `max_pixels` | 196608 | VLM max image resolution |
+| Function | Location | Purpose |
+|----------|----------|---------|
+| `load_physical_aiavdataset()` | `load_physical_aiavdataset.py:27` | Load clip → images + ego history/future |
+| `create_message()` | `helper.py:35` | Build chat messages |
+| `get_processor()` | `helper.py:95` | Init Qwen3-VL-2B processor |
+| `fuse_traj_tokens()` | `base_model.py:168` | Embed history-trajectory tokens |
+| `DeltaTrajectoryTokenizer.encode()` | `delta_tokenizer.py:47` | Trajectory → discrete tokens |
+| `sample_trajectories_from_data_with_vlm_rollout()` | `alpamayo_r1.py:124` | End-to-end inference |
+| `self.vlm.generate()` | transformers | VLM reasoning + KV cache |
+| `StopAfterEOS` | `token_utils.py:172` | Stop at `<|traj_future_start|>` |
+| `ExpertLogitsProcessor` | `alpamayo_r1.py:41` | Mask discrete trajectory logits |
+| `step_fn()` | `alpamayo_r1.py:257` | Per-step denoiser (expert) |
+| `FlowMatching._euler()` | `flow_matching.py:100` | Euler flow-matching loop |
+| `PerWaypointActionInProjV2.forward()` | `action_in_proj.py:148` | (action, t) → embeddings |
+| `action_to_traj()` | `unicycle_accel_curvature.py:300` | Actions → trajectory + rotations |
 
 ---
 
 ## Notes
 
-- **KV Cache Reuse:** The VLM's key-value cache is computed once and reused across all diffusion steps, significantly reducing computation.
-- **Batch Processing:** All 32 trajectory samples are generated in parallel within the diffusion loop.
-- **Action Space:** The model predicts acceleration and curvature (unicycle model), which provides smooth, physically plausible trajectories.
-- **Coordinate Frame:** All trajectories are in the ego-centric (local) coordinate frame, centered at the current vehicle position.
+- **VLM runs once.** Its KV cache (`prompt_cache`) is reused by the expert for
+  every diffusion step; `prompt_cache.crop(prefill_seq_len)` removes the expert's
+  appended keys/values after each step.
+- **Diffusion direction:** noise (t=0) → data (t=1), Euler `x += dt·v`. This is
+  rectified-flow / flow-matching, not score-based DDPM.
+- **Action space:** the model predicts `(acceleration, curvature)` per waypoint;
+  the unicycle unroll produces smooth, physically-plausible trajectories.
+- **Coordinate frame:** everything is ego-centric, centered at the vehicle pose
+  at `t0` (the last history step).
+- **Shapes:** `num_traj_samples` (default 6 in the API; the test script uses 1)
+  trajectories of `n_waypoints=64` steps are produced per call.

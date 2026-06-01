@@ -13,6 +13,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Multi-GPU-friendly logging utilities for Alpamayo-R1.
+
+Provides colored console logging via :mod:`colorlog` and a distributed-aware
+logger adapter (:class:`RankedLogger`) that prefixes each record with the global
+process rank and can optionally restrict output to the rank-zero process. Used to
+keep log output readable when running under Hydra and/or multi-process training.
+"""
+
 import logging
 import sys
 from typing import Mapping
